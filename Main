@@ -1,0 +1,629 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, doc, setDoc, updateDoc, deleteDoc, getDoc } from 'firebase/firestore';
+import { Send, MessageSquare, Code, Palette, Gamepad, Music, Settings, Edit, Trash2, Save, X, Smile, Users } from 'lucide-react'; // Added Users icon for online board
+import * as Tone from 'tone'; // Import Tone.js for sound effects
+
+// Ensure __app_id and __firebase_config are defined in the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+// Helper function to convert Firestore Timestamp to readable string
+const formatTimestamp = (timestamp) => {
+  if (!timestamp) return '';
+  const date = timestamp.toDate();
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+};
+
+// Emoji data (a selection of common emojis)
+const emojis = [
+  '😀', '😁', '😂', '🤣', '😊', '😇', '🙂', '🙃', '😉', '�',
+  '😍', '🥰', '😘', '😗', '😙', '😚', '😋', '😛', '😜', '🤪',
+  '😎', '🤩', '🥳', '😏', '😒', '😞', '😔', '😟', '😕', '🙁',
+  '😢', '😭', '🥺', '😤', '😠', '😡', '🤬', '🤯', '😳', '🥵',
+  '🥶', '😱', '😨', '🤫', '🤔', '🤭', '🤗', '🤝', '👍', '👎',
+  '👏', '🙌', '🙏', '❤️', '💔', '✨', '🔥', '🎉', '💡', '🚀',
+  '🌈', '🌟', '💫', '🎶', '🎵', '💻', '📱', '🎮', '🎨', '📚',
+];
+
+// Main App Component
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [userName, setUserName] = useState('');
+  const [userStatus, setUserStatus] = useState(''); // New state for user status
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [currentChannel, setCurrentChannel] = useState('general');
+  const [messages, setMessages] = useState([]);
+  const [newMessage, setNewMessage] = useState('');
+  const messagesEndRef = useRef(null);
+  const [showNicknameModal, setShowNicknameModal] = useState(true);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false); // State for emoji picker
+  const [onlineUsers, setOnlineUsers] = useState([]); // New state for online users
+
+  // State for editing messages
+  const [editingMessageId, setEditingMessageId] = useState(null);
+  const [editingMessageText, setEditingMessageText] = useState('');
+
+  // Tone.js synth for message send sound
+  const synth = useRef(null);
+
+  // Function to update user's online status
+  const updateUserPresence = useCallback(async (currentUserId, currentUserName, currentUserStatus, firestore) => {
+    if (!currentUserId || !firestore) return;
+
+    const userDocRef = doc(firestore, `artifacts/${appId}/public/data/users`, currentUserId);
+    try {
+      await setDoc(userDocRef, {
+        nickname: currentUserName,
+        status: currentUserStatus,
+        lastSeen: serverTimestamp(),
+        userId: currentUserId // Storing full userId as required
+      }, { merge: true });
+    } catch (error) {
+      console.error("Error updating user presence:", error);
+    }
+  }, [appId]);
+
+  useEffect(() => {
+    // Initialize Tone.js synth
+    synth.current = new Tone.Synth().toDestination();
+    synth.current.oscillator.type = "sine";
+    synth.current.envelope.attack = 0.01;
+    synth.current.envelope.decay = 0.1;
+    synth.current.envelope.sustain = 0.0;
+    synth.current.envelope.release = 0.1;
+
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+
+      setDb(firestore);
+      setAuth(firebaseAuth);
+
+      const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          const userDocRef = doc(firestore, `artifacts/${appId}/users/${user.uid}/profile/data`);
+          const userDoc = await getDoc(userDocRef);
+          if (userDoc.exists()) {
+            const data = userDoc.data();
+            if (data.nickname) {
+              setUserName(data.nickname);
+            }
+            if (data.status) {
+              setUserStatus(data.status);
+            }
+            setShowNicknameModal(!data.nickname);
+          } else {
+            setShowNicknameModal(true);
+          }
+        } else {
+          try {
+            if (typeof __initial_auth_token !== 'undefined') {
+              await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+            } else {
+              await signInAnonymously(firebaseAuth);
+            }
+          } catch (error) {
+            console.error("Error signing in:", error);
+          }
+        }
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribeAuth();
+    } catch (error) {
+      console.error("Failed to initialize Firebase:", error);
+    }
+  }, []);
+
+  // Effect for updating user presence periodically
+  useEffect(() => {
+    let presenceInterval;
+    if (db && userId && userName && isAuthReady) {
+      // Initial presence update
+      updateUserPresence(userId, userName, userStatus, db);
+
+      // Set up interval for periodic updates
+      presenceInterval = setInterval(() => {
+        updateUserPresence(userId, userName, userStatus, db);
+      }, 15000); // Update every 15 seconds
+
+      // Clean up interval on component unmount
+      return () => clearInterval(presenceInterval);
+    }
+  }, [db, userId, userName, userStatus, isAuthReady, updateUserPresence]);
+
+  // Effect for listening to online users
+  useEffect(() => {
+    if (db && isAuthReady) {
+      const usersColRef = collection(db, `artifacts/${appId}/public/data/users`);
+      const q = query(usersColRef, orderBy('lastSeen', 'desc')); // Order by last seen
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const now = Date.now();
+        const fetchedUsers = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        })).filter(user => {
+          // Consider user online if lastSeen is within the last 60 seconds
+          return user.lastSeen && (now - user.lastSeen.toDate().getTime() < 60000);
+        });
+        setOnlineUsers(fetchedUsers);
+      }, (error) => {
+        console.error("Error fetching online users:", error);
+      });
+
+      return () => unsubscribe();
+    }
+  }, [db, isAuthReady, appId]);
+
+
+  // Scroll to the bottom of the messages list
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  // Fetch messages for the current channel
+  useEffect(() => {
+    if (db && isAuthReady) {
+      const messagesColRef = collection(db, `artifacts/${appId}/public/data/channels/${currentChannel}/messages`);
+      const q = query(messagesColRef, orderBy('timestamp', 'asc')); // Order by timestamp
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedMessages = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        setMessages(fetchedMessages);
+        scrollToBottom(); // Scroll to bottom on new messages
+      }, (error) => {
+        console.error("Error fetching messages:", error);
+      });
+
+      return () => unsubscribe();
+    }
+  }, [db, isAuthReady, currentChannel, appId]);
+
+  // Handle sending a new message
+  const handleSendMessage = async () => {
+    if (newMessage.trim() === '' || !db || !userId || !userName) return;
+
+    try {
+      await addDoc(collection(db, `artifacts/${appId}/public/data/channels/${currentChannel}/messages`), {
+        text: newMessage,
+        timestamp: serverTimestamp(),
+        user: userName,
+        userId: userId, // Include the full userId as required
+        channel: currentChannel,
+      });
+      setNewMessage('');
+      setShowEmojiPicker(false); // Close emoji picker after sending
+      // Play send sound
+      if (synth.current) {
+        await Tone.start(); // Ensure audio context is started
+        synth.current.triggerAttackRelease("C5", "8n"); // Play a C5 note for an 8th note duration
+      }
+      scrollToBottom();
+    } catch (error) {
+      console.error("Error sending message:", error);
+    }
+  };
+
+  // Handle nickname and status submission
+  const handleNicknameSubmit = async (e) => {
+    e.preventDefault();
+    if (userName.trim() === '' || !db || !userId) return;
+
+    try {
+      // Store nickname and status in user's private profile
+      const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/profile/data`);
+      await setDoc(userDocRef, { nickname: userName, status: userStatus }, { merge: true });
+      setShowNicknameModal(false); // Close modal after setting nickname
+      // Update public presence immediately after setting nickname/status
+      updateUserPresence(userId, userName, userStatus, db);
+    } catch (error) {
+      console.error("Error saving nickname/status:", error);
+    }
+  };
+
+  // --- Message Editing & Deletion Functions ---
+  const handleEditClick = (message) => {
+    setEditingMessageId(message.id);
+    setEditingMessageText(message.text);
+  };
+
+  const handleSaveEdit = async () => {
+    if (editingMessageText.trim() === '' || !db || !editingMessageId) return;
+
+    try {
+      const messageDocRef = doc(db, `artifacts/${appId}/public/data/channels/${currentChannel}/messages`, editingMessageId);
+      await updateDoc(messageDocRef, {
+        text: editingMessageText,
+        editedAt: serverTimestamp(), // Add an 'editedAt' timestamp
+      });
+      setEditingMessageId(null);
+      setEditingMessageText('');
+    } catch (error) {
+      console.error("Error saving edited message:", error);
+    }
+  };
+
+  const handleCancelEdit = () => {
+    setEditingMessageId(null);
+    setEditingMessageText('');
+  };
+
+  const handleDeleteMessage = async (messageId) => {
+    // In a real app, you might want a confirmation modal here
+    try {
+      const messageDocRef = doc(db, `artifacts/${appId}/public/data/channels/${currentChannel}/messages`, messageId);
+      await deleteDoc(messageDocRef);
+    } catch (error) {
+      console.error("Error deleting message:", error);
+    }
+  };
+  // --- End Message Editing & Deletion Functions ---
+
+  // Handle emoji selection
+  const handleEmojiSelect = (emoji) => {
+    setNewMessage((prev) => prev + emoji);
+    // Optionally close picker after selection, or keep open for multiple
+    // setShowEmojiPicker(false);
+  };
+
+  // Channels configuration
+  const channels = [
+    { id: 'general', name: 'General Chat', icon: <MessageSquare size={20} /> },
+    { id: 'tech', name: 'Tech Talk', icon: <Code size={20} /> },
+    { id: 'art', name: 'Art & Design', icon: <Palette size={20} /> },
+    { id: 'gaming', name: 'Gaming Zone', icon: <Gamepad size={20} /> },
+    { id: 'music', name: 'Music Lounge', icon: <Music size={20} /> },
+  ];
+
+  // Loading state
+  if (!isAuthReady) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-blue-200 via-purple-200 to-pink-200 text-gray-800 animate-gradient-shift">
+        <div className="text-xl font-semibold animate-pulse text-white text-shadow-lg">Loading AeroChat...</div>
+      </div>
+    );
+  }
+
+  // Nickname Modal
+  if (showNicknameModal) {
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
+        <div className="bg-gradient-to-br from-blue-500 to-purple-600 p-8 rounded-3xl shadow-2xl backdrop-blur-md border border-white border-opacity-30 text-white w-full max-w-md animate-fade-in custom-glow">
+          <h2 className="text-3xl font-bold mb-6 text-center text-shadow-lg">Welcome to AeroChat!</h2>
+          <p className="text-lg mb-6 text-center">Please enter a nickname and optional status.</p>
+          <form onSubmit={handleNicknameSubmit} className="flex flex-col gap-4">
+            <input
+              type="text"
+              value={userName}
+              onChange={(e) => setUserName(e.target.value)}
+              placeholder="Enter your nickname (required)"
+              className="w-full p-4 rounded-xl bg-white bg-opacity-20 border border-white border-opacity-30 placeholder-white placeholder-opacity-70 focus:outline-none focus:ring-2 focus:ring-white focus:ring-opacity-50 text-white text-lg transition-all duration-300 custom-input-glow"
+              maxLength={20}
+              required
+            />
+            <input
+              type="text"
+              value={userStatus}
+              onChange={(e) => setUserStatus(e.target.value)}
+              placeholder="Set your status (e.g., Online, AFK)"
+              className="w-full p-4 rounded-xl bg-white bg-opacity-20 border border-white border-opacity-30 placeholder-white placeholder-opacity-70 focus:outline-none focus:ring-2 focus:ring-white focus:ring-opacity-50 text-white text-lg transition-all duration-300 custom-input-glow"
+              maxLength={50}
+            />
+            <button
+              type="submit"
+              className="w-full py-3 px-6 bg-gradient-to-r from-green-400 to-blue-600 text-white font-bold rounded-xl shadow-lg hover:from-green-500 hover:to-blue-700 transition transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-green-300 custom-button-glow"
+            >
+              Join Chat
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-blue-200 via-purple-200 to-pink-200 font-inter text-gray-800 flex flex-col p-4 sm:p-6 lg:p-8 animate-gradient-shift">
+      {/* Header */}
+      <header className="mb-6 flex flex-col sm:flex-row items-center justify-between p-4 bg-white bg-opacity-30 rounded-3xl shadow-lg backdrop-blur-md border border-white border-opacity-30 transition-all duration-300 hover:shadow-xl hover:border-blue-300 custom-glow">
+        <h1 className="text-3xl sm:text-4xl font-extrabold text-gray-900 text-shadow-md mb-2 sm:mb-0">
+          <span className="bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-purple-700">
+            AeroChat
+          </span>
+        </h1>
+        <div className="flex flex-col sm:flex-row items-center space-x-0 sm:space-x-3 space-y-2 sm:space-y-0">
+          <span className="text-lg font-medium text-gray-800 flex items-center gap-2">
+            Welcome, <span className="font-bold text-purple-700">{userName}</span>
+            {userStatus && <span className="text-sm text-gray-600 bg-white bg-opacity-50 px-2 py-0.5 rounded-full border border-white border-opacity-70">{userStatus}</span>}
+          </span>
+          {userId && (
+            <span className="text-sm text-gray-600 bg-white bg-opacity-40 px-3 py-1 rounded-full border border-white border-opacity-50">
+              ID: {userId.substring(0, 8)}...
+            </span>
+          )}
+          <button
+            onClick={() => setShowNicknameModal(true)}
+            className="p-2 bg-white bg-opacity-40 rounded-full hover:bg-opacity-60 transition-all duration-200 transform hover:scale-110 focus:outline-none focus:ring-2 focus:ring-blue-300 custom-button-glow"
+            title="Change Nickname/Status"
+          >
+            <Settings size={20} className="text-gray-700" />
+          </button>
+        </div>
+      </header>
+
+      {/* Main Chat Area */}
+      <div className="flex flex-1 flex-col lg:flex-row gap-6 h-full"> {/* Added h-full here */}
+        {/* Left Sidebar: Channel Selector & Online Users */}
+        <div className="lg:w-1/4 xl:w-1/5 flex flex-col gap-6">
+          {/* Channel Selector */}
+          <nav className="bg-white bg-opacity-30 rounded-3xl shadow-lg backdrop-blur-md border border-white border-opacity-30 p-4 flex flex-col transition-all duration-300 hover:shadow-xl hover:border-purple-300 custom-glow">
+            <h2 className="text-2xl font-bold mb-4 text-gray-900 text-center lg:text-left">Channels</h2>
+            <div className="flex lg:flex-col gap-3 overflow-x-auto lg:overflow-x-hidden pb-2 lg:pb-0">
+              {channels.map((channel) => (
+                <button
+                  key={channel.id}
+                  onClick={() => setCurrentChannel(channel.id)}
+                  className={`flex items-center gap-3 px-5 py-3 rounded-xl font-semibold transition-all duration-300
+                    ${currentChannel === channel.id
+                      ? 'bg-gradient-to-r from-blue-500 to-purple-600 text-white shadow-lg transform scale-105 border border-blue-400 custom-button-glow'
+                      : 'bg-white bg-opacity-40 text-gray-800 hover:bg-opacity-60 hover:shadow-md border border-white border-opacity-50'
+                    }`}
+                >
+                  {channel.icon}
+                  <span className="whitespace-nowrap">{channel.name}</span>
+                </button>
+              ))}
+            </div>
+          </nav>
+
+          {/* Online Users Board */}
+          <div className="bg-white bg-opacity-30 rounded-3xl shadow-lg backdrop-blur-md border border-white border-opacity-30 p-4 flex flex-col transition-all duration-300 hover:shadow-xl hover:border-teal-300 custom-glow">
+            <h2 className="text-2xl font-bold mb-4 text-gray-900 flex items-center gap-2">
+              <Users size={24} /> Online Users ({onlineUsers.length})
+            </h2>
+            <div className="flex-1 overflow-y-auto custom-scrollbar">
+              {onlineUsers.length === 0 ? (
+                <p className="text-gray-600 text-sm">No one's online right now.</p>
+              ) : (
+                <ul className="space-y-2">
+                  {onlineUsers.map((user) => (
+                    <li key={user.id} className="flex items-center gap-2 text-gray-800 text-sm">
+                      <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                      <span className="font-semibold">{user.nickname}</span>
+                      {user.status && <span className="text-xs text-gray-600 opacity-80">({user.status})</span>}
+                      <span className="text-xs text-gray-500 ml-auto">ID: {user.userId.substring(0, 6)}...</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </div>
+
+
+        {/* Chat Window */}
+        <div className="flex-1 bg-white bg-opacity-30 rounded-3xl shadow-lg backdrop-blur-md border border-white border-opacity-30 flex flex-col overflow-hidden transition-all duration-300 hover:shadow-xl hover:border-green-300 custom-glow">
+          <div className="p-4 border-b border-white border-opacity-30">
+            <h2 className="text-2xl font-bold text-gray-900">
+              <span className="bg-clip-text text-transparent bg-gradient-to-r from-green-500 to-teal-600">
+                #{currentChannel}
+              </span>
+            </h2>
+          </div>
+
+          {/* Messages Display */}
+          <div className="flex-1 p-4 overflow-y-auto custom-scrollbar">
+            {messages.length === 0 ? (
+              <div className="text-center text-gray-600 py-10">No messages yet. Be the first to say something!</div>
+            ) : (
+              messages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`flex items-start mb-4 group ${msg.userId === userId ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div
+                    className={`max-w-[70%] p-3 rounded-xl shadow-md backdrop-blur-sm relative transition-all duration-200
+                      ${msg.userId === userId
+                        ? 'bg-gradient-to-bl from-blue-400 to-purple-500 text-white rounded-br-none border border-blue-300 custom-message-glow-blue'
+                        : 'bg-white bg-opacity-60 text-gray-900 rounded-bl-none border border-white border-opacity-70 custom-message-glow-white'
+                      }`}
+                  >
+                    <div className="font-bold text-sm mb-1 flex items-center justify-between">
+                      <span>
+                        {msg.user}
+                        {msg.userId === userId && <span className="text-xs opacity-70 ml-2">(You)</span>}
+                      </span>
+                      {msg.editedAt && (
+                        <span className="text-xs opacity-60 ml-2 italic">(edited)</span>
+                      )}
+                    </div>
+                    {editingMessageId === msg.id ? (
+                      <div className="flex flex-col gap-2">
+                        <input
+                          type="text"
+                          value={editingMessageText}
+                          onChange={(e) => setEditingMessageText(e.target.value)}
+                          onKeyPress={(e) => e.key === 'Enter' && handleSaveEdit()}
+                          className="w-full p-2 rounded-lg bg-white bg-opacity-80 border border-blue-400 text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 custom-input-glow"
+                        />
+                        <div className="flex justify-end gap-2">
+                          <button
+                            onClick={handleSaveEdit}
+                            className="p-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors flex items-center gap-1 custom-button-glow"
+                            title="Save Edit"
+                          >
+                            <Save size={16} /> Save
+                          </button>
+                          <button
+                            onClick={handleCancelEdit}
+                            className="p-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors flex items-center gap-1 custom-button-glow"
+                            title="Cancel Edit"
+                          >
+                            <X size={16} /> Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="text-base break-words">{msg.text}</p>
+                        <div className="text-xs mt-1 opacity-80 text-right">
+                          {formatTimestamp(msg.timestamp)}
+                        </div>
+                        {msg.userId === userId && (
+                          <div className="absolute top-1 right-1 flex space-x-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                            <button
+                              onClick={() => handleEditClick(msg)}
+                              className="p-1 bg-white bg-opacity-20 rounded-full hover:bg-opacity-40 transition-colors custom-button-glow"
+                              title="Edit Message"
+                            >
+                              <Edit size={14} className="text-white" />
+                            </button>
+                            <button
+                              onClick={() => handleDeleteMessage(msg.id)}
+                              className="p-1 bg-white bg-opacity-20 rounded-full hover:bg-opacity-40 transition-colors custom-button-glow"
+                              title="Delete Message"
+                            >
+                              <Trash2 size={14} className="text-red-300" />
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+            <div ref={messagesEndRef} /> {/* Scroll target */}
+          </div>
+
+          {/* Message Input */}
+          <div className="p-4 border-t border-white border-opacity-30 relative">
+            {showEmojiPicker && (
+              <div className="absolute bottom-full left-0 mb-2 w-full bg-white bg-opacity-90 rounded-xl shadow-lg p-3 grid grid-cols-8 gap-2 max-h-48 overflow-y-auto custom-scrollbar custom-glow">
+                {emojis.map((emoji, index) => (
+                  <button
+                    key={index}
+                    onClick={() => handleEmojiSelect(emoji)}
+                    className="p-1 text-2xl hover:bg-gray-200 rounded-md transition-colors"
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="flex space-x-3">
+              <button
+                onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+                className="p-3 bg-white bg-opacity-40 rounded-xl hover:bg-opacity-60 transition-all duration-200 transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-blue-300 custom-button-glow"
+                title="Choose Emoji"
+              >
+                <Smile size={24} className="text-gray-700" />
+              </button>
+              <input
+                type="text"
+                value={newMessage}
+                onChange={(e) => setNewMessage(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+                placeholder="Type your message..."
+                className="flex-1 p-3 rounded-xl bg-white bg-opacity-40 border border-white border-opacity-30 placeholder-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-400 text-gray-900 transition-all duration-300 hover:border-blue-500 custom-input-glow"
+              />
+              <button
+                onClick={handleSendMessage}
+                className="p-3 bg-gradient-to-r from-blue-500 to-purple-600 text-white rounded-xl shadow-lg hover:from-blue-600 hover:to-purple-700 transition transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-blue-300 custom-button-glow"
+                title="Send Message"
+              >
+                <Send size={24} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Footer */}
+      <footer className="mt-6 text-center text-gray-700 text-sm opacity-80">
+        <p>&copy; {new Date().getFullYear()} AeroChat. Designed with Fruitger Aero & Futurism vibes.</p>
+      </footer>
+
+      {/* Custom Styles for Glow and Animations */}
+      <style jsx>{`
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: rgba(255, 255, 255, 0.2);
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: rgba(147, 51, 234, 0.7); /* Purple-600 with opacity */
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: rgba(147, 51, 234, 0.9);
+        }
+        .text-shadow-md {
+          text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .text-shadow-lg {
+          text-shadow: 3px 3px 6px rgba(0, 0, 0, 0.2);
+        }
+        /* Added for hover effect on message bubbles to show edit/delete */
+        .group:hover .opacity-0 {
+          opacity: 1;
+        }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+        .font-inter {
+          font-family: 'Inter', sans-serif;
+        }
+
+        /* Custom Glow Effects */
+        .custom-glow {
+          box-shadow: 0 0 15px rgba(139, 92, 246, 0.4), 0 0 30px rgba(99, 102, 241, 0.3); /* Purple-500 and Indigo-500 */
+        }
+        .custom-input-glow:focus {
+          box-shadow: 0 0 10px rgba(96, 165, 250, 0.6); /* Blue-400 */
+        }
+        .custom-button-glow:hover {
+          box-shadow: 0 0 15px rgba(34, 197, 94, 0.5), 0 0 25px rgba(59, 130, 246, 0.4); /* Green-500 and Blue-500 */
+        }
+        .custom-message-glow-blue {
+          box-shadow: 0 0 8px rgba(96, 165, 250, 0.4); /* Blue-400 */
+        }
+        .custom-message-glow-white {
+          box-shadow: 0 0 8px rgba(255, 255, 255, 0.5); /* White */
+        }
+
+        /* Background Gradient Animation */
+        @keyframes gradient-shift {
+          0% { background-position: 0% 50%; }
+          50% { background-position: 100% 50%; }
+          100% { background-position: 0% 50%; }
+        }
+        .animate-gradient-shift {
+          background-size: 200% 200%;
+          animation: gradient-shift 15s ease infinite;
+        }
+
+        /* Fade-in animation for modal */
+        @keyframes fade-in {
+          from { opacity: 0; transform: translateY(-20px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+          animation: fade-in 0.5s ease-out forwards;
+        }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
+�
